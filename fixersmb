@@ -1,0 +1,102 @@
+# SMB Fixer Script with Tailscale IP selection and fixes
+
+# Function to get Tailscale clients and IPs
+function Get-TailscaleClients {
+    $tailscaleStatus = tailscale status 2>$null
+    if (-not $tailscaleStatus) {
+        Write-Host "Tailscale CLI not found or tailscale not running." -ForegroundColor Red
+        return @()
+    }
+    $clients = @()
+    foreach ($line in $tailscaleStatus) {
+        if ($line -match '^(\d{1,3}(\.\d{1,3}){3})\s+(\S+)\s+(\S+)@') {
+            $ip = $matches[1]
+            $name = $matches[3]
+            $clients += [PSCustomObject]@{
+                IP = $ip
+                Name = $name
+            }
+        }
+    }
+    return $clients
+}
+
+Write-Host "=== SMB Fixer Interactive ===`n"
+
+# List Tailscale clients
+$clients = Get-TailscaleClients
+if ($clients.Count -eq 0) {
+    Write-Host "No Tailscale clients found or tailscale not running." -ForegroundColor Yellow
+    $targetIP = Read-Host "Enter the target IP address manually"
+} else {
+    Write-Host "Available Tailscale clients:"
+    for ($i = 0; $i -lt $clients.Count; $i++) {
+        Write-Host "[$i] $($clients[$i].IP)  $($clients[$i].Name)"
+    }
+    $selection = Read-Host "Select IP address by number (or type 'M' to manually enter IP)"
+    if ($selection -match '^[0-9]+$' -and $selection -ge 0 -and $selection -lt $clients.Count) {
+        $targetIP = $clients[$selection].IP
+    } else {
+        $targetIP = Read-Host "Enter the target IP address manually"
+    }
+}
+
+Write-Host "`nTarget IP set to: $targetIP`n"
+
+# Check SMB port connectivity
+$ports = @(445, 139)
+foreach ($port in $ports) {
+    try {
+        $socket = New-Object System.Net.Sockets.TcpClient
+        $async = $socket.BeginConnect($targetIP, $port, $null, $null)
+        $wait = $async.AsyncWaitHandle.WaitOne(2000, $false)
+        if ($wait -and $socket.Connected) {
+            Write-Host "Port ${port} is OPEN." -ForegroundColor Green
+            $socket.EndConnect($async)
+        } else {
+            Write-Host "Port ${port} is CLOSED or filtered." -ForegroundColor Red
+        }
+        $socket.Dispose()
+    } catch {
+        Write-Host ("Error checking port ${port}: " + $_.Exception.Message) -ForegroundColor Red
+    }
+}
+
+# Enable SMB1 if disabled
+try {
+    $smb1 = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" -Name "SMB1" -ErrorAction SilentlyContinue
+    if ($smb1 -and $smb1.SMB1 -eq 0) {
+        Write-Host "SMB1 is disabled. Attempting to enable SMB1..."
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" -Name "SMB1" -Value 1
+        Write-Host "SMB1 enabled. You may need to restart the computer." -ForegroundColor Yellow
+    } else {
+        Write-Host "SMB1 is enabled or registry key not present."
+    }
+} catch {
+    Write-Host ("Error checking/enabling SMB1: " + $_.Exception.Message) -ForegroundColor Red
+}
+
+# Enable SMB2 if disabled
+try {
+    $smb2 = Get-SmbServerConfiguration
+    if (-not $smb2.EnableSMB2Protocol) {
+        Write-Host "SMB2 protocol is disabled. Enabling SMB2..."
+        Set-SmbServerConfiguration -EnableSMB2Protocol $true -Force
+        Write-Host "SMB2 enabled."
+    } else {
+        Write-Host "SMB2 protocol is enabled."
+    }
+} catch {
+    Write-Host ("Error checking/enabling SMB2: " + $_.Exception.Message) -ForegroundColor Red
+}
+
+# Restart the Server service
+try {
+    Write-Host "Restarting 'Server' service to apply changes..."
+    Restart-Service -Name "LanmanServer" -Force -ErrorAction Stop
+    Write-Host "'Server' service restarted successfully."
+} catch {
+    Write-Host ("Failed to restart 'Server' service: " + $_.Exception.Message) -ForegroundColor Red
+}
+
+Write-Host "`nSMB Fixer script completed."
